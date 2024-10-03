@@ -17,7 +17,6 @@ from funding.models.database import User, Proposal, ProposalStatus
 
 bp_proposals_api = Blueprint('bp_proposals_api', __name__, url_prefix='/api/proposals')
 
-
 @bp_proposals_api.post("/upsert")
 @validate_request(ProposalUpsert, source=DataSource.JSON)
 @login_required

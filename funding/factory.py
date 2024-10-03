@@ -1,13 +1,16 @@
 import os, re, json, logging, hashlib, asyncio
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Union
 from datetime import datetime
-
+import json
+import aiohttp
 import timeago
+from quart import jsonify
 from peewee import PostgresqlDatabase, SqliteDatabase, ProgrammingError
 from playhouse.shortcuts import ReconnectMixin
 from aiocryptocurrency.coins import Coin, SUPPORTED_COINS
+from aiocryptocurrency import TransactionSet, Transaction
+
 from aiocryptocurrency.coins.nero import Wownero, Monero
-from aiocryptocurrency.coins.firo import Firo
 from quart import Quart, render_template, session, request, g
 from quart_schema import RequestSchemaValidationError
 from quart_session import Session
@@ -18,12 +21,157 @@ from funding.utils.globals import COINS_LOOKUP
 from funding.utils.rates import Rates
 import settings
 
+class Firo(Coin):
+    def __init__(self):
+        super(Firo, self).__init__()
+        self.host = '127.0.0.1'
+        self.port = 8888
+        self.basic_auth: Optional[tuple[str]] = None
+        self.url = None
+
+    async def send(self, address: str, amount: float) -> str:
+        """returns txid"""
+        if amount <= 0:
+            raise Exception("amount cannot be zero or less")
+
+        data = {
+            "method": "sendtoaddress",
+            "params": [address, amount]
+        }
+
+        blob = await self._make_request(data=data)
+        return blob['result']
+
+    async def mintspark(self, sparkAddress: str, amount: float, memo: str = "") -> str:
+        """returns txid"""
+        if amount <= 0:
+            raise Exception("amount cannot be zero or less")
+
+        params = {
+            sparkAddress: {
+                "amount": amount,
+                "memo": memo
+            }
+        }
+
+        data = {
+            "method": "mintspark",
+            "params": [params]
+        }
+
+        blob = await self._make_request(data=data)
+        return blob['result']
+
+
+    async def create_address(self) -> dict:
+        """Returns both a transparent address and a Spark address."""
+
+        address_data = {
+            "method": "getnewaddress"
+        }
+        address_blob = await self._make_request(data=address_data)
+        address = address_blob['result']
+
+        if address is None or not isinstance(address, str):
+            raise Exception("Invalid standard address result")
+
+        return {
+            "address": address,
+        }
+
+    async def tx_details(self, txid: str):
+        if not isinstance(txid, str) or not txid:
+            raise Exception("bad address")
+
+        data = {
+            "method": "gettransaction",
+            "params": [txid]
+        }
+
+        blob = await self._make_request(data=data)
+        return blob['result']
+
+    async def list_txs(self, address: str = None, payment_id: str = None, minimum_confirmations: int = 3) -> Optional[TransactionSet]:
+        txset = TransactionSet()
+        if not isinstance(address, str) or not address:
+            raise Exception("bad address")
+
+        results = await self._make_request(data={
+            "method": "listreceivedbyaddress",
+            "params": [minimum_confirmations]
+        })
+
+        if not isinstance(results.get('result'), list):
+            return txset
+
+        try:
+            result = [r for r in results['result'] if r['address'] == address][0]
+        except Exception as ex:
+            return txset
+
+        for txid in result.get('txids', []):
+            # fetch tx details
+            tx = await self.tx_details(txid)
+
+            # fetch blockheight
+            tx['blockheight'] = await self.blockheight(tx['blockhash'])
+            date = datetime.fromtimestamp(tx['blocktime'])
+
+            txset.add(Transaction(amount=tx['amount'],
+                                  txid=tx['txid'],
+                                  date=date,
+                                  blockheight=tx['blockheight'],
+                                  direction='in',
+                                  confirmations=tx['confirmations']))
+
+        return txset
+
+    async def blockheight(self, blockhash: str) -> int:
+        """blockhash -> blockheight"""
+        if not isinstance(blockhash, str) or not blockhash:
+            raise Exception("bad address")
+
+        data = {
+            "method": "getblock",
+            "params": [blockhash]
+        }
+        blob = await self._make_request(data=data)
+
+        height = blob['result'].get('height', 0)
+        return height
+
+    async def _generate_url(self) -> None:
+        self.url = f'http://{self.host}:{self.port}/'
+
+    async def _make_request(self, data: dict = None) -> dict:
+        await self._generate_url()
+
+        opts = {
+            "headers": {
+                "User-Agent": self.user_agent
+            }
+        }
+
+        if self.basic_auth:
+            opts['auth'] = await self._make_basic_auth()
+
+        async with aiohttp.ClientSession(**opts) as session:
+            async with session.post(self.url, json=data) as resp:
+                if resp.status == 401:
+                    raise Exception("Unauthorized")
+                blob = await resp.json()
+                if 'result' not in blob:
+                    if blob:
+                        blob = json.dumps(blob, indent=4, sort_keys=True)
+                    raise Exception(f"Invalid response: {blob}")
+                return blob
+
 cache = None
 peewee = None
 rates = Rates()
 app: Optional[Quart] = None
 openid: Optional[OpenID] = None
-crypto_provider: Optional[Firo] = None
+crypto_provider: Optional[Firo] = Firo()
 coin: Optional[dict] = None
 discourse = Discourse()
 proposal_task = None
@@ -46,7 +194,6 @@ database = ReconnectingPGDatabase(
     host=settings.DB_HOST,
     port=settings.DB_PORT
 )
-
 
 async def _setup_postgres(app: Quart):
     import peewee
@@ -115,7 +262,6 @@ async def _setup_crypto(app: Quart):
     if settings.COIN_RPC_AUTH:
         crypto_provider.basic_auth = settings.COIN_RPC_AUTH
 
-
 async def _setup_cache(app: Quart):
     global cache
     app.config['SESSION_TYPE'] = 'redis'
@@ -148,7 +294,6 @@ async def _setup_error_handlers(app: Quart):
 def create_app():
     global app
     app = Quart(__name__)
-
     app.logger.setLevel(logging.INFO)
     app.secret_key = settings.APP_SECRET
 
@@ -197,7 +342,7 @@ def create_app():
 
     @app.errorhandler(RequestSchemaValidationError)
     async def handle_request_validation_error(error):
-        return {"errors": error.validation_error.json()}, 400
+        return jsonify({"errors": str(error)}), 400
 
     @app.before_serving
     async def startup():
