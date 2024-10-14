@@ -60,7 +60,12 @@ class Firo(Coin):
         }
 
         blob = await self._make_request(data=data)
-        return blob['result']
+
+        txids = blob['result']
+        if isinstance(txids, list):
+            txids = ', '.join(txids)
+
+        return txids
 
 
     async def create_address(self) -> dict:
