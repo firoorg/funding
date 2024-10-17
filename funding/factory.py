@@ -84,6 +84,17 @@ class Firo(Coin):
             "address": address,
         }
 
+    async def check_address(self, addr_receiving: str) -> str:
+        """Check address validation."""
+
+        validation_data = {
+            "method": "validateaddress",
+            "params": [addr_receiving]
+        }
+        validation_blob = await self._make_request(data=validation_data)
+
+        return validation_blob['result']
+
     async def tx_details(self, txid: str):
         if not isinstance(txid, str) or not txid:
             raise Exception("bad address")
