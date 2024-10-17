@@ -55,7 +55,7 @@ class ProposalUpsert(BaseModel):
     category: ProposalCategory
     status: Optional[ProposalStatus]
     discourse_topic_id: Optional[int]
-    addr_receiving: constr(min_length=8, max_length=128)
+    addr_receiving: constr(min_length=8, max_length=255)
 
     class Config:
         use_enum_values = False
