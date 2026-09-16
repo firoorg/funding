@@ -46,8 +46,30 @@ async def login():
 
 @bp_auth.route("/auth/forgot/", methods=['GET', 'POST'])
 async def forgot():
-    message = "'Forgot password' functionality is currently unsupported. Please ask an admin for a password change."
+    message = "Self-service password resets are not available. Please ask an admin to set a new password on your user page."
     return await render_template("error.html", message=message, code=404)
+
+
+@bp_auth.route("/auth/user/<path:name>/password", methods=["POST"])
+@admin_required
+async def user_password_set(name: str):
+    try:
+        user = User.select().filter(User.username == name).get()
+    except:
+        return abort(404)
+
+    blob = await request.form
+    password = blob.get('password', '')
+
+    if len(password) <= 4:
+        await flash("Password length must exceed 5 characters")
+        return redirect(url_for('bp_routes.user_page', name=name))
+
+    user.password = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    user.save()
+
+    await flash(f"Password set for user '{user.username}'")
+    return redirect(url_for('bp_routes.user_page', name=name))
 
 
 @bp_auth.route("/auth/user/<path:name>/admin/toggle", methods=["POST"])
