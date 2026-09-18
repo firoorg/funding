@@ -259,6 +259,12 @@ async def _setup_settings(app: Quart):
             raise Exception("DISCOURSE_API_KEY not set.")
         settings.DISCOURSE_DOMAIN = settings.DISCOURSE_DOMAIN.replace("/", "")
 
+    if getattr(settings, "MAIL_ENABLED", False):
+        if not getattr(settings, "MAIL_FROM", ""):
+            raise Exception("MAIL_FROM not set. e.g: noreply@mg.domain.org")
+        if not getattr(settings, "SMTP_HOST", ""):
+            raise Exception("SMTP_HOST not set. e.g: smtp.mailgun.org")
+
     if isinstance(settings.OPENID_CFG, dict):
         for needle in ['client_id', 'client_secret', 'configuration']:
             if needle not in settings.OPENID_CFG:
