@@ -445,6 +445,13 @@ class Proposal(pw.Model):
         if proposal._is_new:
             proposal.slug = proposal.generate_slug(data.title)
 
+        blob = await crypto_provider.check_address(data.addr_receiving)
+        if data.addr_receiving[0] == 'a' and not blob['isvalid']:
+             raise Exception("Invalid Address")
+
+        elif data.addr_receiving[0] == 's' and not blob['isvalidSpark']:
+             raise Exception("Invalid Spark Address")
+
         proposal.set_addr_receiving(data.addr_receiving, user)
         await proposal.set_category(data.category, user)
         await proposal.set_status(data.status, user)

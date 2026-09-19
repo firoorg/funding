@@ -73,7 +73,6 @@ async def funds(slug: str = None):
 
     return await render_template("proposals/funds.html", proposal=proposal, crumbs=crumbs)
 
-
 @bp_proposals.post("/<path:slug>/funds/transfer")
 @validate_request(ProposalFundsTransfer, source=DataSource.FORM)
 @admin_required
@@ -103,9 +102,14 @@ async def funds_transfer(data: ProposalFundsTransfer, slug: str = None):
 
     destination = data.destination.strip()
     try:
-        txid = await crypto_provider.send(
-            address=destination,
+        if (destination[0] == 's'):
+            txid = await crypto_provider.mintspark(
+            sparkAddress=destination,
             amount=amount)
+        else:
+            txid = await crypto_provider.send(
+                address=destination,
+                amount=amount)
     except Exception as ex:
         return f"Error sending to '{destination}': {ex}"
 
