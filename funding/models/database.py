@@ -4,8 +4,9 @@ import asyncio
 from typing import List, Optional
 from uuid import uuid4
 import hashlib
+import secrets
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import peewee as pw
 from peewee import JOIN
@@ -87,6 +88,120 @@ class User(pw.Model):
             "role": self.role.value,
             "mail_md5": hashlib.md5(self.mail.encode()).hexdigest()
         }
+
+
+class PasswordReset(pw.Model):
+    uuid = pw.UUIDField(primary_key=True, default=uuid4)
+    created = pw.DateTimeField(default=datetime.now)
+    user = pw.ForeignKeyField(User, backref='password_resets')
+    token_hash = pw.CharField(max_length=64, unique=True, index=True)
+    expires = pw.DateTimeField()
+    used = pw.DateTimeField(null=True)
+
+    RATE_WINDOW = 3600
+    RATE_MAX = 3
+
+    class Meta:
+        from funding.factory import database
+        database = database
+
+    @staticmethod
+    def hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @staticmethod
+    def ttl() -> int:
+        import settings
+        return int(getattr(settings, "PASSWORD_RESET_TTL", 3600))
+
+    @staticmethod
+    def may_request(user: 'User') -> bool:
+        since = datetime.now() - timedelta(seconds=PasswordReset.RATE_WINDOW)
+        count = PasswordReset.select().where(
+            (PasswordReset.user == user.uuid) &
+            (PasswordReset.created > since)
+        ).count()
+        return count < PasswordReset.RATE_MAX
+
+    @staticmethod
+    def issue(user: 'User') -> Optional[str]:
+        from funding.factory import database
+        token = secrets.token_urlsafe(32)
+        with database.atomic():
+            lock = User.select().where(User.uuid == user.uuid)
+            if database.for_update:
+                lock = lock.for_update()
+            lock.first()
+
+            if not PasswordReset.may_request(user):
+                return None
+
+            PasswordReset.create(
+                user=user,
+                token_hash=PasswordReset.hash_token(token),
+                expires=datetime.now() + timedelta(seconds=PasswordReset.ttl())
+            )
+        return token
+
+    @staticmethod
+    def revoke(token: str) -> None:
+        if not token:
+            return
+        PasswordReset.delete().where(
+            PasswordReset.token_hash == PasswordReset.hash_token(token)
+        ).execute()
+
+    @staticmethod
+    def resolve(token: str) -> Optional['User']:
+        if not token:
+            return None
+        try:
+            row = PasswordReset.select().where(
+                PasswordReset.token_hash == PasswordReset.hash_token(token)
+            ).get()
+        except Exception:
+            return None
+
+        if row.used is not None or row.expires < datetime.now():
+            return None
+
+        user = row.user
+        if not user or not user.enabled or user.oip:
+            return None
+        return user
+
+    @staticmethod
+    def consume(token: str) -> Optional['User']:
+        from funding.factory import database
+        if not token:
+            return None
+
+        now = datetime.now()
+        token_hash = PasswordReset.hash_token(token)
+
+        with database.atomic():
+            claimed = PasswordReset.update(used=now).where(
+                (PasswordReset.token_hash == token_hash) &
+                PasswordReset.used.is_null(True) &
+                (PasswordReset.expires > now)
+            ).execute()
+
+            if claimed != 1:
+                return None
+
+            row = PasswordReset.select().where(
+                PasswordReset.token_hash == token_hash
+            ).get()
+
+            PasswordReset.update(used=now).where(
+                (PasswordReset.user == row.user_id) &
+                PasswordReset.used.is_null(True)
+            ).execute()
+
+        user = row.user
+        if not user or not user.enabled or user.oip:
+            return None
+        return user
 
 
 class Proposal(pw.Model):
