@@ -10,7 +10,7 @@ from email_validator import validate_email, EmailNotValidError
 
 import settings
 from funding import login_required, admin_required, moderator_required
-from funding.factory import openid
+from funding.factory import openid, database
 from funding.auth.models import UserRegisterForm
 from funding.models.database import User, PasswordReset, UserRole
 from funding.utils.mail import send_mail, mail_enabled
@@ -108,21 +108,23 @@ async def forgot():
     except peewee.DoesNotExist:
         pass
 
-    if user and user.enabled and not user.oip and PasswordReset.may_request(user):
+    if user and user.enabled and not user.oip:
         token = PasswordReset.issue(user)
-        try:
-            await send_mail(
-                user.mail,
-                RESET_SUBJECT.format(domain=settings.DOMAIN),
-                RESET_BODY.format(
-                    username=user.username,
-                    domain=settings.DOMAIN,
-                    link=reset_link(token),
-                    minutes=int(PasswordReset.ttl() / 60)
+        if token:
+            try:
+                await send_mail(
+                    user.mail,
+                    RESET_SUBJECT.format(domain=settings.DOMAIN),
+                    RESET_BODY.format(
+                        username=user.username,
+                        domain=settings.DOMAIN,
+                        link=reset_link(token),
+                        minutes=int(PasswordReset.ttl() / 60)
+                    )
                 )
-            )
-        except Exception as ex:
-            app.logger.error(f"PASSWORD_RESET_MAIL_FAILED: {ex}")
+            except Exception as ex:
+                PasswordReset.revoke(token)
+                app.logger.error(f"PASSWORD_RESET_MAIL_FAILED: {ex}")
 
     await flash(RESET_SENT_MESSAGE)
     return await render_template("forgot.html")
@@ -157,12 +159,16 @@ async def reset(token: str):
         await flash("Passwords do not match")
         return await render_template("reset.html", token=token)
 
-    user = PasswordReset.consume(token)
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    with database.atomic():
+        user = PasswordReset.consume(token)
+        if user:
+            user.password = password_hash
+            user.save()
+
     if not user:
         return await render_template("error.html", message=expired, code=404), 404
-
-    user.password = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    user.save()
 
     session.clear()
     await flash("Password changed. Please log in.")

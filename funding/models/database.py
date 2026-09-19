@@ -124,14 +124,32 @@ class PasswordReset(pw.Model):
         return count < PasswordReset.RATE_MAX
 
     @staticmethod
-    def issue(user: 'User') -> str:
+    def issue(user: 'User') -> Optional[str]:
+        from funding.factory import database
         token = secrets.token_urlsafe(32)
-        PasswordReset.create(
-            user=user,
-            token_hash=PasswordReset.hash_token(token),
-            expires=datetime.now() + timedelta(seconds=PasswordReset.ttl())
-        )
+        with database.atomic():
+            lock = User.select().where(User.uuid == user.uuid)
+            if database.for_update:
+                lock = lock.for_update()
+            lock.first()
+
+            if not PasswordReset.may_request(user):
+                return None
+
+            PasswordReset.create(
+                user=user,
+                token_hash=PasswordReset.hash_token(token),
+                expires=datetime.now() + timedelta(seconds=PasswordReset.ttl())
+            )
         return token
+
+    @staticmethod
+    def revoke(token: str) -> None:
+        if not token:
+            return
+        PasswordReset.delete().where(
+            PasswordReset.token_hash == PasswordReset.hash_token(token)
+        ).execute()
 
     @staticmethod
     def resolve(token: str) -> Optional['User']:
@@ -154,29 +172,31 @@ class PasswordReset(pw.Model):
 
     @staticmethod
     def consume(token: str) -> Optional['User']:
+        from funding.factory import database
         if not token:
             return None
 
         now = datetime.now()
         token_hash = PasswordReset.hash_token(token)
 
-        claimed = PasswordReset.update(used=now).where(
-            (PasswordReset.token_hash == token_hash) &
-            PasswordReset.used.is_null(True) &
-            (PasswordReset.expires > now)
-        ).execute()
+        with database.atomic():
+            claimed = PasswordReset.update(used=now).where(
+                (PasswordReset.token_hash == token_hash) &
+                PasswordReset.used.is_null(True) &
+                (PasswordReset.expires > now)
+            ).execute()
 
-        if claimed != 1:
-            return None
+            if claimed != 1:
+                return None
 
-        row = PasswordReset.select().where(
-            PasswordReset.token_hash == token_hash
-        ).get()
+            row = PasswordReset.select().where(
+                PasswordReset.token_hash == token_hash
+            ).get()
 
-        PasswordReset.update(used=now).where(
-            (PasswordReset.user == row.user_id) &
-            PasswordReset.used.is_null(True)
-        ).execute()
+            PasswordReset.update(used=now).where(
+                (PasswordReset.user == row.user_id) &
+                PasswordReset.used.is_null(True)
+            ).execute()
 
         user = row.user
         if not user or not user.enabled or user.oip:
