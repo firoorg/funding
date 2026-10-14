@@ -80,11 +80,16 @@ class User(pw.Model):
         except:
             pass
 
+    @property
+    def password_version(self):
+        return hashlib.sha256(self.password.encode()).hexdigest()
+
     async def to_json(self):
         return {
             "uuid": self.uuid,
             "username": self.username,
             "mail": self.mail,
+            "password_version": self.password_version if self.password else None,
             "role": self.role.value,
             "mail_md5": hashlib.md5(self.mail.encode()).hexdigest()
         }
@@ -152,6 +157,12 @@ class PasswordReset(pw.Model):
         ).execute()
 
     @staticmethod
+    def revoke_user(user_id) -> None:
+        PasswordReset.update(used=datetime.now()).where(
+            (PasswordReset.user == user_id) & PasswordReset.used.is_null(True)
+        ).execute()
+
+    @staticmethod
     def resolve(token: str) -> Optional['User']:
         if not token:
             return None
@@ -176,10 +187,20 @@ class PasswordReset(pw.Model):
         if not token:
             return None
 
-        now = datetime.now()
         token_hash = PasswordReset.hash_token(token)
 
         with database.atomic():
+            row = PasswordReset.select().where(PasswordReset.token_hash == token_hash).first()
+            if row is None:
+                return None
+            lock = User.select().where(User.uuid == row.user_id)
+            if database.for_update:
+                lock = lock.for_update()
+            user = lock.get()
+            if not user.enabled or user.oip:
+                return None
+
+            now = datetime.now()
             claimed = PasswordReset.update(used=now).where(
                 (PasswordReset.token_hash == token_hash) &
                 PasswordReset.used.is_null(True) &
@@ -189,18 +210,8 @@ class PasswordReset(pw.Model):
             if claimed != 1:
                 return None
 
-            row = PasswordReset.select().where(
-                PasswordReset.token_hash == token_hash
-            ).get()
+            PasswordReset.revoke_user(user.uuid)
 
-            PasswordReset.update(used=now).where(
-                (PasswordReset.user == row.user_id) &
-                PasswordReset.used.is_null(True)
-            ).execute()
-
-        user = row.user
-        if not user or not user.enabled or user.oip:
-            return None
         return user
 
 
