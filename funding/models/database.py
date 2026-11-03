@@ -4,8 +4,9 @@ import asyncio
 from typing import List, Optional
 from uuid import uuid4
 import hashlib
+import secrets
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import peewee as pw
 from peewee import JOIN
@@ -87,6 +88,100 @@ class User(pw.Model):
             "role": self.role.value,
             "mail_md5": hashlib.md5(self.mail.encode()).hexdigest()
         }
+
+
+class PasswordReset(pw.Model):
+    uuid = pw.UUIDField(primary_key=True, default=uuid4)
+    created = pw.DateTimeField(default=datetime.now)
+    user = pw.ForeignKeyField(User, backref='password_resets')
+    token_hash = pw.CharField(max_length=64, unique=True, index=True)
+    expires = pw.DateTimeField()
+    used = pw.DateTimeField(null=True)
+
+    RATE_WINDOW = 3600
+    RATE_MAX = 3
+
+    class Meta:
+        from funding.factory import database
+        database = database
+
+    @staticmethod
+    def hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @staticmethod
+    def ttl() -> int:
+        import settings
+        return int(getattr(settings, "PASSWORD_RESET_TTL", 3600))
+
+    @staticmethod
+    def may_request(user: 'User') -> bool:
+        since = datetime.now() - timedelta(seconds=PasswordReset.RATE_WINDOW)
+        count = PasswordReset.select().where(
+            (PasswordReset.user == user.uuid) &
+            (PasswordReset.created > since)
+        ).count()
+        return count < PasswordReset.RATE_MAX
+
+    @staticmethod
+    def issue(user: 'User') -> str:
+        token = secrets.token_urlsafe(32)
+        PasswordReset.create(
+            user=user,
+            token_hash=PasswordReset.hash_token(token),
+            expires=datetime.now() + timedelta(seconds=PasswordReset.ttl())
+        )
+        return token
+
+    @staticmethod
+    def resolve(token: str) -> Optional['User']:
+        if not token:
+            return None
+        try:
+            row = PasswordReset.select().where(
+                PasswordReset.token_hash == PasswordReset.hash_token(token)
+            ).get()
+        except Exception:
+            return None
+
+        if row.used is not None or row.expires < datetime.now():
+            return None
+
+        user = row.user
+        if not user or not user.enabled or user.oip:
+            return None
+        return user
+
+    @staticmethod
+    def consume(token: str) -> Optional['User']:
+        if not token:
+            return None
+
+        now = datetime.now()
+        token_hash = PasswordReset.hash_token(token)
+
+        claimed = PasswordReset.update(used=now).where(
+            (PasswordReset.token_hash == token_hash) &
+            PasswordReset.used.is_null(True) &
+            (PasswordReset.expires > now)
+        ).execute()
+
+        if claimed != 1:
+            return None
+
+        row = PasswordReset.select().where(
+            PasswordReset.token_hash == token_hash
+        ).get()
+
+        PasswordReset.update(used=now).where(
+            (PasswordReset.user == row.user_id) &
+            PasswordReset.used.is_null(True)
+        ).execute()
+
+        user = row.user
+        if not user or not user.enabled or user.oip:
+            return None
+        return user
 
 
 class Proposal(pw.Model):
@@ -267,11 +362,16 @@ class Proposal(pw.Model):
         except Exception as ex:
             app.logger.error(f"Discourse new_topic error: {ex}")
 
-    def set_discourse_topic_id(self, topic_id: int, user: User):
+    def check_discourse_topic_id_permission(self, topic_id: Optional[int], user: User = None):
         if not isinstance(topic_id, int) or topic_id == self.discourse_topic_id:
             return
-        if not user.is_moderator:
+        if not user or not user.is_moderator:
             raise Exception("insufficient permissions to change 'discourse_topic_id'")
+
+    def set_discourse_topic_id(self, topic_id: int, user: User):
+        self.check_discourse_topic_id_permission(topic_id, user)
+        if not isinstance(topic_id, int) or topic_id == self.discourse_topic_id:
+            return
         self.discourse_topic_id = topic_id
         self.modified = datetime.now()
 
@@ -400,7 +500,7 @@ class Proposal(pw.Model):
 
     async def generate_discourse_topic(self, topic_id: Optional[int], user=None):
         if isinstance(topic_id, int) and topic_id != self.discourse_topic_id:
-            self.discourse_topic_id = topic_id
+            self.set_discourse_topic_id(topic_id, user)
             self._events.append(Event(message="Discourse topic id changed", proposal=self, user=user))
             return
         if not settings.DISCOURSE_ENABLED or isinstance(self.discourse_topic_id, int):
@@ -440,6 +540,9 @@ class Proposal(pw.Model):
         if user.is_anon or (
                 not user.is_moderator and proposal.user.username != user.username):
             raise Exception("insufficient permissions.")
+
+        # Reject forged associations before applying changes or invoking their side effects.
+        proposal.check_discourse_topic_id_permission(data.discourse_topic_id, user)
 
         proposal.title = data.title
         if proposal._is_new:
